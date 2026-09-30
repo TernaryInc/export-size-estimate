@@ -55,7 +55,6 @@ if [[ "${POS[0]}" =~ ^https?:// ]]; then
     echo "warning: no YYYYMMDD-YYYYMMDD period folder in URL path; using its parent folder as the export root" >&2
     PREFIX="${path%/*}/"; [[ "$path" == */* ]] || PREFIX=""
   fi
-  echo "Parsed URL -> account=$ACCOUNT container=$CONTAINER export-root='$PREFIX'"
 else
   [[ ${#POS[@]} -ge 2 ]] || usage
   ACCOUNT="${POS[0]}"; CONTAINER="${POS[1]}"; PREFIX="${POS[2]:-}"
@@ -63,7 +62,7 @@ else
 fi
 # Auth modes to try in order; AZ_AUTH_MODE pins a single one.
 if [[ -n "${AZ_AUTH_MODE:-}" ]]; then AUTH_MODES=("$AZ_AUTH_MODE"); else AUTH_MODES=(login key); fi
-AUTH=""
+AUTH=""; FAILS=""
 
 if [[ -z "$DAY" ]]; then
   if date -v1d >/dev/null 2>&1; then DAY=$(date -v1d -v-1d +%F)
@@ -73,35 +72,31 @@ fi
 
 # --- preflight: check dependencies one by one, fail fast -------------------
 need() { # need CMD HINT
-  if command -v "$1" >/dev/null 2>&1; then echo "  ok   $1"; else echo "  MISSING $1 -- $2" >&2; exit 1; fi
+  if command -v "$1" >/dev/null 2>&1; then true; else echo "MISSING $1: $2" >&2; exit 1; fi
 }
-echo "== Preflight"
 need az   "install Azure CLI (brew install azure-cli)"
 need awk  "required"
 need sed  "required"
 need tr   "required"
 need sort "required"
 need date "required"
-if command -v jq >/dev/null 2>&1; then HAVE_JQ=1; echo "  ok   jq (optional)"; else HAVE_JQ=0; echo "  skip jq (optional; summaries will be raw)"; fi
+if command -v jq >/dev/null 2>&1; then HAVE_JQ=1; else HAVE_JQ=0; fi
 sub=$(az account show --query name -o tsv 2>&1) \
-  || { echo "  FAIL az login required: $sub" >&2; exit 1; }
-echo "  ok   az logged in (subscription: $sub)"
+  || { echo "FAIL az login required: $sub" >&2; exit 1; }
 for mode in "${AUTH_MODES[@]}"; do
   if probe=$(az storage blob list --account-name "$ACCOUNT" --container-name "$CONTAINER" --auth-mode "$mode" --num-results 1 --only-show-errors -o tsv 2>&1 >/dev/null); then
     AUTH="$mode"; break
   fi
-  echo "  fail --auth-mode $mode: $(echo "$probe" | sed 's/^ERROR: *//' | grep -m1 '[[:alnum:]]')" >&2
+  FAILS+="  --auth-mode $mode: $(echo "$probe" | sed 's/^ERROR: *//' | grep -m1 '[[:alnum:]]')"$'\n'
 done
-[[ -n "$AUTH" ]] || { echo "  FAIL cannot list $ACCOUNT/$CONTAINER with any auth mode (${AUTH_MODES[*]})" >&2; exit 1; }
-echo "  ok   container $ACCOUNT/$CONTAINER reachable (auth-mode=$AUTH)"
-echo
+[[ -n "$AUTH" ]] || { echo "FAIL cannot list $ACCOUNT/$CONTAINER:" >&2; printf '%s' "$FAILS" >&2; exit 1; }
 
 OUT="${OUT:-./azure-size-out/${ACCOUNT}-${CONTAINER}-${DAY}}"
 mkdir -p "$OUT/manifests"
 AZO=(--account-name "$ACCOUNT" --container-name "$CONTAINER" --auth-mode "$AUTH" --only-show-errors)
 PFX=(); [[ -n "$PREFIX" ]] && PFX=(--prefix "$PREFIX")
 
-echo "== Account=$ACCOUNT container=$CONTAINER prefix='$PREFIX' day=$DAY (UTC) out=$OUT"
+echo "$ACCOUNT/$CONTAINER/$PREFIX day=$DAY auth=$AUTH out=$OUT"
 
 # --- 1. blobs written on that day -----------------------------------------
 az storage blob list "${AZO[@]}" "${PFX[@]}" --num-results '*' -o tsv \
@@ -110,13 +105,11 @@ az storage blob list "${AZO[@]}" "${PFX[@]}" --num-results '*' -o tsv \
 awk -F'\t' 'NF>=3 && $2 ~ /^[0-9]+$/' "$OUT/raw_list.txt" > "$OUT/files.tsv"
 
 if [[ ! -s "$OUT/files.tsv" ]]; then
-  echo "No blobs modified on $DAY under '$PREFIX' (check prefix/date/auth)." >&2
+  echo "no blobs modified on $DAY under '$PREFIX' (check prefix/date)." >&2
 fi
 
-echo
-echo "== Size by export period and kind (blobs modified on $DAY)"
 awk -F'\t' '
-  function human(b,  u,i){split("B KiB MiB GiB TiB",u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}return sprintf("%.2f %s",b,u[i])}
+  function human(b,  u,i){split("B KiB MiB GiB TiB",u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}return sprintf("%.1f %s",b,u[i])}
   {
     kind = ($1 ~ /[Mm]anifest\.json$/) ? "manifest" : "data"
     per="-"; n=split($1,p,"/")
@@ -124,26 +117,18 @@ awk -F'\t' '
     k=per SUBSEP kind; c[k]++; b[k]+=$2; tc[kind]++; tb[kind]+=$2
   }
   END{
-    for(k in c){ split(k,a,SUBSEP); printf "%-20s %-9s %6d files %14d B  %s\n", a[1],a[2],c[k],b[k],human(b[k]) | "sort" }
+    for(k in c){ split(k,a,SUBSEP); printf "%-18s %-8s %4d files  %10s\n", a[1],a[2],c[k],human(b[k]) | "sort" }
     close("sort")
-    printf "TOTAL data     %6d files %14d B  %s\n", tc["data"],tb["data"],human(tb["data"])
-    printf "TOTAL manifest %6d files %14d B  %s\n", tc["manifest"],tb["manifest"],human(tb["manifest"])
   }' "$OUT/files.tsv"
 
 DATA_BYTES=$(awk -F'\t' '$1 !~ /[Mm]anifest\.json$/ {s+=$2} END{print s+0}' "$OUT/files.tsv")
 DIM=$((10#${DAY:8:2}))
-echo
-echo "== Projection (day data = $DATA_BYTES B)"
-echo "  If that day's files are a full month-to-date dump : ~1 month of data = $DATA_BYTES B per month"
-echo "    (retained copies multiply this if dataOverwriteBehavior is CreateNewReport)"
-echo "  If they are only that calendar day                 : ~$((DATA_BYTES * DIM)) B per month (x$DIM days)"
+awk -v b="$DATA_BYTES" -v d="$DIM" 'function human(b,  u,i){split("B KiB MiB GiB TiB",u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}return sprintf("%.1f %s",b,u[i])} BEGIN{printf "day data %s; per month: ~%s if month-to-date dump, ~%s if daily-only\n", human(b), human(b), human(b*d)}'
 
 # --- 2. manifests -----------------------------------------------------------
-echo
-echo "== Manifests"
 MAN_KEYS=$(awk -F'\t' '$1 ~ /[Mm]anifest\.json$/ {print $1}' "$OUT/files.tsv")
 if [[ -z "$MAN_KEYS" ]]; then
-  echo "  none modified on $DAY; falling back to the most recently modified manifest.json under the prefix"
+  echo "no manifest modified on $DAY; using latest" >&2
   MAN_KEYS=$(az storage blob list "${AZO[@]}" "${PFX[@]}" --num-results '*' -o tsv \
     --query "sort_by([?ends_with(name, 'anifest.json')], &properties.lastModified)[-1].name" 2>/dev/null | grep -v '^None$' || true)
 fi
@@ -151,7 +136,7 @@ while IFS= read -r name; do
   [[ -n "$name" ]] || continue
   dest="$OUT/manifests/$(echo "$name" | tr '/' '_')"
   az storage blob download "${AZO[@]}" --name "$name" --file "$dest" --no-progress --overwrite true >/dev/null
-  echo "-- $name -> $dest"
+  echo "manifest: $name"
   if [[ $HAVE_JQ -eq 1 ]]; then
     jq -c '{export: .exportConfig, delivery: .deliveryConfig, run: .runInfo, byteCount, blobCount, dataRowCount}' "$dest" 2>/dev/null \
       || jq -c 'with_entries(select(.value|type!="array"))' "$dest" || true
@@ -160,14 +145,10 @@ done <<< "$MAN_KEYS"
 
 # --- 3. export definitions (optional) --------------------------------------
 if [[ -n "$SCOPE" ]]; then
-  echo
-  echo "== Export definitions at scope $SCOPE"
   if az costmanagement export list --scope "$SCOPE" -o json > "$OUT/export_definitions.json" 2>"$OUT/export_definitions.err"; then
     if [[ $HAVE_JQ -eq 1 ]]; then
       jq -c '(.value // .)[] | {name, schedule: .schedule, timeframe: .definition.timeframe, type: .definition.type, format, dest: .deliveryInfo.destination, dataset: .definition.dataSet.granularity}' "$OUT/export_definitions.json" || true
-    else echo "  saved $OUT/export_definitions.json"; fi
-  else echo "  az costmanagement export list failed (see $OUT/export_definitions.err)"; fi
+    fi
+  else echo "export definitions unavailable (see $OUT/export_definitions.err)" >&2; fi
 fi
 
-echo
-echo "Done. Raw listing: $OUT/files.tsv"
